@@ -1,0 +1,6 @@
+node_modules/
+.env
+scanwise.db
+scanwise.db-shm
+scanwise.db-wal
+coverage/
