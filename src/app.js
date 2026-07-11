@@ -4,6 +4,7 @@ const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const Stripe = require('stripe');
+const rateLimit = require('express-rate-limit');
 const { z } = require('zod');
 
 const GOALS = [
@@ -213,25 +214,24 @@ function createApp(options = {}) {
   const stripeSecret = options.stripeSecret || process.env.STRIPE_SECRET_KEY;
   const stripeWebhookSecret = options.stripeWebhookSecret || process.env.STRIPE_WEBHOOK_SECRET;
   const stripe = stripeSecret ? new Stripe(stripeSecret) : null;
-  const allowedOrigin = options.allowedOrigin || process.env.CORS_ORIGIN || '*';
+  const allowedOrigin = options.allowedOrigin || process.env.CORS_ORIGIN || 'http://localhost:3000';
+  const allowedOrigins = allowedOrigin.split(',').map((v) => v.trim()).filter(Boolean);
 
-  app.use(cors({ origin: allowedOrigin === '*' ? true : allowedOrigin.split(','), credentials: true }));
+  app.use(cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error('CORS origin not allowed'));
+    },
+    credentials: true
+  }));
   app.use(express.json({ limit: '1mb' }));
-
-  const limiter = new Map();
-  app.use((req, res, next) => {
-    const now = Date.now();
-    const key = req.ip || 'local';
-    const rec = limiter.get(key) || { ts: now, count: 0 };
-    if (now - rec.ts > 60000) {
-      rec.ts = now;
-      rec.count = 0;
-    }
-    rec.count += 1;
-    limiter.set(key, rec);
-    if (rec.count > 300) return res.status(429).json({ error: 'Too many requests' });
-    return next();
-  });
+  app.use(rateLimit({
+    windowMs: 60 * 1000,
+    limit: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests' }
+  }));
 
   function auth(req, res, next) {
     const token = (req.headers.authorization || '').replace('Bearer ', '');
