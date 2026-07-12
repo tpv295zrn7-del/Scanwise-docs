@@ -1,0 +1,19 @@
+version: '3.9'
+services:
+  api:
+    build: .
+    ports:
+      - "3001:3001"
+    volumes:
+      - db-data:/app/data
+    env_file: .env
+    environment:
+      - DB_PATH=/app/data/scanwise.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+volumes:
+  db-data:
