@@ -1,0 +1,43 @@
+{
+  "name": "scanwise-docs",
+  "version": "1.0.0",
+  "description": "ScanWise: Complete project documentation, architecture, and roadmap",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "jest --runInBand",
+    "test:watch": "jest --watch",
+    "lint": "echo \"No lint configured\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tpv295zrn7-del/Scanwise-docs.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/tpv295zrn7-del/Scanwise-docs/issues"
+  },
+  "homepage": "https://github.com/tpv295zrn7-del/Scanwise-docs#readme",
+  "dependencies": {
+    "@react-native-async-storage/async-storage": "^1.18.0",
+    "@react-native-firebase/analytics": "^17.0.0",
+    "@react-native-firebase/app": "^17.0.0",
+    "@react-navigation/bottom-tabs": "^6.5.0",
+    "@react-navigation/native": "^6.1.0",
+    "@react-navigation/native-stack": "^6.9.0",
+    "@reduxjs/toolkit": "^1.9.5",
+    "@stripe/react-native": "^5.5.0",
+    "axios": "^1.16.0",
+    "react": "^18.2.0",
+    "react-native": "^0.72.0",
+    "react-native-camera": "^4.2.1",
+    "react-native-gesture-handler": "^2.13.0",
+    "react-native-vector-icons": "^9.2.0",
+    "react-redux": "^8.1.3",
+    "sentry-react-native": "^5.0.0"
+  },
+  "devDependencies": {
+    "jest": "^30.4.2"
+  }
+}
