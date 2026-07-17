@@ -23,23 +23,20 @@ Base URL: `http://localhost:3001`
 - `PUT /api/profiles/:id`
 
 ## Payments / Subscriptions
-- `POST /api/subscriptions/start` (premium monthly/annual + 14-day trial)
+- `POST /api/subscriptions/start`
 - `GET /api/subscriptions/status`
 - `POST /api/subscriptions/cancel`
 - `POST /api/subscriptions/upgrade`
 - `GET /api/subscriptions/invoices`
 - `POST /api/payments/webhooks/stripe`
 
-## Gamification
-- `POST /api/gamification/events` (`incident_report`, `community_vote`, `verification`)
-- `GET /api/gamification/me`
-- `GET /api/gamification/leaderboard`
-
 ## Core Product Endpoints
 - `GET /api/products/:barcode`
+- `GET /api/products/:barcode/incidents`
 - `POST /api/scans`
 - `GET /api/scans/history`
 - `GET /api/alternatives/:barcode?goals=lower_sugar,higher_protein`
+- `GET /api/search/products`
 - `GET /api/saved-items`
 - `POST /api/saved-items`
 - `DELETE /api/saved-items/:barcode`
@@ -50,16 +47,66 @@ Base URL: `http://localhost:3001`
 - `POST /api/corrections/:id/verify` (medical role)
 - `GET /api/corrections`
 
+## Incidents
+- `POST /api/incidents`
+- `POST /api/incidents/:id/vote`
+- `GET /api/incidents/search`
+- `GET /api/incidents/analytics`
+
+## Medical Dashboard
+- `POST /api/medical/register`
+- `GET /api/medical/pending-verifications`
+- `POST /api/medical/verify/:incidentId`
+- `POST /api/medical/reject/:incidentId`
+- `GET /api/medical/profile`
+- `GET /api/medical/leaderboard`
+
+## Insights
+- `GET /api/insights/engagement`
+- `GET /api/insights/goal-progress`
+- `GET /api/insights/allergen-alerts`
+- `GET /api/insights/personalized-alternatives`
+- `GET /api/insights/export`
+
+## B2B API
+- `POST /api/b2b/keys` (admin)
+- `GET /api/b2b/allergen-trends`
+- `GET /api/b2b/product-insights/:barcode`
+- `GET /api/b2b/category-analysis`
+- `GET /api/b2b/regional-insights`
+
+## Bulk Import
+- `POST /api/import/products` (admin)
+- `GET /api/import/logs` (admin)
+
+## Admin Dashboard
+- `GET /api/admin/users`
+- `PATCH /api/admin/users/:id/role`
+- `DELETE /api/admin/users/:id`
+- `GET /api/admin/products/pending-review`
+- `PATCH /api/admin/products/:id/approve`
+- `DELETE /api/admin/products/:id`
+- `GET /api/admin/corrections/pending`
+- `PATCH /api/admin/corrections/:id/status`
+- `GET /api/admin/analytics/dashboard`
+- `GET /api/admin/analytics/incidents-by-allergen`
+- `GET /api/admin/analytics/user-growth`
+- `GET /api/admin/analytics/engagement`
+- `GET /api/admin/health`
+
+## Gamification
+- `POST /api/gamification/events`
+- `GET /api/gamification/me`
+- `GET /api/gamification/leaderboard`
+
+## Health
+- `GET /api/health`
+- `GET /api/docs`
+
 ## Security & Error Handling
 - JWT verification middleware for protected endpoints
-- Input validation with Zod on all write routes
+- Admin-only, medical-only, and B2B API-key middleware
+- Input validation with Zod on write routes
 - Per-IP rate limiting
 - Configurable CORS allow-list
 - Structured JSON error responses
-
-## Webhook Notes
-Stripe webhook supports:
-- `invoice.payment_succeeded`
-- `customer.subscription.deleted`
-
-In local/dev mode without Stripe signature headers, JSON payloads are accepted for easier testing.
