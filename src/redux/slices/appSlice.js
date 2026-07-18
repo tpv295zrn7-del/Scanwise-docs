@@ -1,11 +1,14 @@
 /**
- * App State Redux Slice
+ * App State Redux Slice - ENHANCED
  * 
  * Manages global app state:
  * - UI state (loading, modals, navigation)
  * - App initialization status
- * - Notifications/toasts
+ * - Notifications/toasts with dismiss capability
  * - User session
+ * 
+ * DISMISSIBLE NOTIFICATIONS: Users can manually dismiss notifications
+ * TIMESTAMP SYNCING: Per-slice tracking allows independent refresh strategies
  */
 
 import { createSlice } from '@reduxjs/toolkit';
@@ -17,6 +20,7 @@ const appSlice = createSlice({
     isInitialized: false,
     isFirstLaunch: true,
     appVersion: '1.0.0',
+    appBuildNumber: '1',
 
     // User session
     userId: null,
@@ -32,12 +36,17 @@ const appSlice = createSlice({
     currentRoute: 'Onboarding',
     previousRoute: null,
 
-    // Notifications
+    // Notifications/Toasts
+    // Structure: { id, message, type, duration, dismissible, timestamp }
     notifications: [],
 
     // App preferences
     theme: 'light', // 'light' or 'dark'
     language: 'en',
+
+    // App-wide sync strategy
+    lastAppSync: null, // Last time ANY data was synced
+    syncStrategy: 'periodic', // 'periodic', 'on-demand', 'automatic'
   },
 
   reducers: {
@@ -94,18 +103,37 @@ const appSlice = createSlice({
       state.currentRoute = action.payload;
     },
 
-    // Notifications
+    // Enhanced Notifications with dismiss capability
     addNotification: (state, action) => {
-      state.notifications.push({
-        id: Date.now(),
-        ...action.payload,
-      });
+      const notification = {
+        id: action.payload.id || Date.now(),
+        message: action.payload.message,
+        type: action.payload.type || 'info', // 'success', 'error', 'warning', 'info'
+        duration: action.payload.duration || 3000,
+        dismissible: action.payload.dismissible !== false, // Default: true
+        timestamp: new Date().toISOString(),
+      };
+      
+      // Keep only last 5 notifications to prevent memory bloat
+      if (state.notifications.length >= 5) {
+        state.notifications.shift();
+      }
+      
+      state.notifications.push(notification);
     },
 
     removeNotification: (state, action) => {
       state.notifications = state.notifications.filter(
         (n) => n.id !== action.payload
       );
+    },
+
+    // Dismiss specific notification by index (for UI click handlers)
+    dismissNotification: (state, action) => {
+      const index = action.payload;
+      if (index >= 0 && index < state.notifications.length) {
+        state.notifications.splice(index, 1);
+      }
     },
 
     clearNotifications: (state) => {
@@ -119,6 +147,15 @@ const appSlice = createSlice({
 
     setLanguage: (state, action) => {
       state.language = action.payload;
+    },
+
+    // App-wide sync tracking
+    recordAppSync: (state) => {
+      state.lastAppSync = new Date().toISOString();
+    },
+
+    setSyncStrategy: (state, action) => {
+      state.syncStrategy = action.payload; // 'periodic', 'on-demand', 'automatic'
     },
   },
 });
@@ -137,9 +174,12 @@ export const {
   setCurrentRoute,
   addNotification,
   removeNotification,
+  dismissNotification,
   clearNotifications,
   setTheme,
   setLanguage,
+  recordAppSync,
+  setSyncStrategy,
 } = appSlice.actions;
 
 // Selectors
@@ -154,5 +194,17 @@ export const selectCurrentRoute = (state) => state.app.currentRoute;
 export const selectNotifications = (state) => state.app.notifications;
 export const selectTheme = (state) => state.app.theme;
 export const selectLanguage = (state) => state.app.language;
+export const selectLastAppSync = (state) => state.app.lastAppSync;
+export const selectSyncStrategy = (state) => state.app.syncStrategy;
+
+// Helper selector: Get notification count
+export const selectNotificationCount = (state) =>
+  state.app.notifications.length;
+
+// Helper selector: Get latest notification
+export const selectLatestNotification = (state) => {
+  const notifications = state.app.notifications;
+  return notifications.length > 0 ? notifications[notifications.length - 1] : null;
+};
 
 export default appSlice.reducer;
