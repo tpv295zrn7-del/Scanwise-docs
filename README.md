@@ -2,6 +2,8 @@
 
 ScanWise project documentation plus a production-ready Node.js/Express backend scaffold.
 
+This repository currently contains the backend/API implementation for ScanWise. The Batch 3 work in this branch adds stronger authentication, persisted onboarding progress, and richer family health profile support at the API layer.
+
 ## Backend quick start
 
 ```bash
