@@ -12,15 +12,33 @@ Base URL: `http://localhost:3001`
 ## Authentication
 - `POST /api/auth/register`
 - `POST /api/auth/login`
+- `POST /api/auth/refresh`
+- `POST /api/auth/logout`
 - `POST /api/auth/password/forgot`
 - `POST /api/auth/password/reset`
 - `GET /api/auth/me`
 - `PUT /api/auth/me`
 
+Auth responses now include a short-lived access token plus a refresh token. Registration and password reset enforce a stronger password policy: minimum 8 characters including an uppercase letter, number, and special character.
+
 ## Profiles
 - `GET /api/profiles`
 - `POST /api/profiles` (max 5)
 - `PUT /api/profiles/:id`
+
+Profiles support richer health data for onboarding and family setup:
+- `relationship`
+- `allergies` as structured items with `name` and `severity`
+- `conditions`
+- `dietary_preferences`
+- `metrics`
+- sync metadata in responses (`sync.last_updated_at`, `sync.retry_count`)
+
+## Onboarding
+- `GET /api/onboarding`
+- `PUT /api/onboarding`
+
+Onboarding state persists `current_step`, `completed_steps`, arbitrary `preferences`, `skipped`, and computed progress metadata.
 
 ## Payments / Subscriptions
 - `POST /api/subscriptions/start` (premium monthly/annual + 14-day trial)
@@ -53,9 +71,10 @@ Base URL: `http://localhost:3001`
 ## Security & Error Handling
 - JWT verification middleware for protected endpoints
 - Input validation with Zod on all write routes
+- Refresh token rotation and logout revocation
 - Per-IP rate limiting
 - Configurable CORS allow-list
-- Structured JSON error responses
+- Structured JSON error responses with stable `code` values on auth/profile/onboarding flows
 
 ## Webhook Notes
 Stripe webhook supports:

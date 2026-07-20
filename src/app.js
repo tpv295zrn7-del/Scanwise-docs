@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const Stripe = require('stripe');
 const rateLimit = require('express-rate-limit');
@@ -29,8 +30,114 @@ const EVENT_POINTS = {
   verification: 40
 };
 
+const PASSWORD_PATTERN = /^(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
+const ONBOARDING_STEPS = ['welcome', 'health_goals', 'allergies', 'family_profiles', 'review'];
+
 function monthKey(date = new Date()) {
   return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function normalizeEmail(email) {
+  return String(email).trim().toLowerCase();
+}
+
+function parseJson(value, fallback) {
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function ensureColumn(db, table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!columns.some((item) => item.name === column)) {
+    db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+  }
+}
+
+function passwordMeetsPolicy(password) {
+  return PASSWORD_PATTERN.test(password);
+}
+
+function createAccessToken(user, secret) {
+  return jwt.sign({ sub: user.id, email: user.email, role: user.role }, secret, { expiresIn: '7d' });
+}
+
+function issueRefreshToken(db, userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + (30 * 24 * 60 * 60 * 1000)).toISOString();
+  db.prepare('INSERT INTO refresh_tokens (token, user_id, expires_at) VALUES (?, ?, ?)').run(token, userId, expiresAt);
+  return token;
+}
+
+function sanitizeAllergies(allergies = []) {
+  return allergies.map((item) => {
+    if (typeof item === 'string') return { name: item, severity: 'unknown' };
+    return { name: item.name, severity: item.severity || 'unknown' };
+  });
+}
+
+function formatProfile(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    relationship: row.relationship || null,
+    allergies: sanitizeAllergies(parseJson(row.allergies, [])),
+    goals: parseJson(row.goals, []),
+    conditions: parseJson(row.conditions, []),
+    dietary_preferences: parseJson(row.dietary_preferences, []),
+    metrics: parseJson(row.metrics, {}),
+    created_at: row.created_at,
+    sync: {
+      last_updated_at: row.last_updated_at || row.created_at,
+      retry_count: row.sync_retry_count || 0
+    }
+  };
+}
+
+function defaultOnboardingState() {
+  return {
+    current_step: ONBOARDING_STEPS[0],
+    completed_steps: [],
+    preferences: {},
+    skipped: false,
+    completed_at: null
+  };
+}
+
+function formatOnboardingState(row) {
+  const completedSteps = parseJson(row.completed_steps, []);
+  return {
+    current_step: row.current_step || ONBOARDING_STEPS[0],
+    completed_steps: completedSteps,
+    preferences: parseJson(row.preferences, {}),
+    skipped: Boolean(row.skipped),
+    completed_at: row.completed_at || null,
+    progress: {
+      completed: completedSteps.length,
+      total: ONBOARDING_STEPS.length,
+      percent: Math.round((completedSteps.length / ONBOARDING_STEPS.length) * 100)
+    }
+  };
+}
+
+function getOnboardingState(db, userId) {
+  let row = db.prepare('SELECT * FROM onboarding_state WHERE user_id = ?').get(userId);
+  if (!row) {
+    const initial = defaultOnboardingState();
+    db.prepare(`
+      INSERT INTO onboarding_state (user_id, current_step, completed_steps, preferences, skipped, completed_at)
+      VALUES (?, ?, ?, ?, 0, NULL)
+    `).run(userId, initial.current_step, JSON.stringify(initial.completed_steps), JSON.stringify(initial.preferences));
+    row = db.prepare('SELECT * FROM onboarding_state WHERE user_id = ?').get(userId);
+  }
+  return formatOnboardingState(row);
+}
+
+function sendError(res, status, code, error) {
+  return res.status(status).json({ code, error });
 }
 
 function createDb(dbPath = ':memory:') {
@@ -61,6 +168,23 @@ function createDb(dbPath = ':memory:') {
       allergies TEXT DEFAULT '[]',
       goals TEXT DEFAULT '[]',
       created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS refresh_tokens (
+      token TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS onboarding_state (
+      user_id INTEGER PRIMARY KEY,
+      current_step TEXT DEFAULT 'welcome',
+      completed_steps TEXT DEFAULT '[]',
+      preferences TEXT DEFAULT '{}',
+      skipped INTEGER DEFAULT 0,
+      completed_at TEXT,
+      updated_at TEXT DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS subscriptions (
@@ -157,6 +281,13 @@ function createDb(dbPath = ':memory:') {
     );
   `);
 
+  ensureColumn(db, 'profiles', 'relationship', 'TEXT');
+  ensureColumn(db, 'profiles', 'conditions', 'TEXT DEFAULT \'[]\'');
+  ensureColumn(db, 'profiles', 'dietary_preferences', 'TEXT DEFAULT \'[]\'');
+  ensureColumn(db, 'profiles', 'metrics', 'TEXT DEFAULT \'{}\'');
+  ensureColumn(db, 'profiles', 'last_updated_at', 'TEXT DEFAULT (datetime(\'now\'))');
+  ensureColumn(db, 'profiles', 'sync_retry_count', 'INTEGER DEFAULT 0');
+
   const count = db.prepare('SELECT COUNT(*) AS c FROM products').get().c;
   if (!count) {
     const insert = db.prepare('INSERT INTO products (barcode, name, category, brand, nutrition, ingredients, estimated_price, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
@@ -204,7 +335,7 @@ function grantGamification(db, userId, eventType) {
 }
 
 function makeToken(user, secret) {
-  return jwt.sign({ sub: user.id, email: user.email, role: user.role }, secret, { expiresIn: '7d' });
+  return createAccessToken(user, secret);
 }
 
 function createApp(options = {}) {
@@ -235,12 +366,12 @@ function createApp(options = {}) {
 
   function auth(req, res, next) {
     const token = (req.headers.authorization || '').replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Missing token' });
+    if (!token) return sendError(res, 401, 'AUTH_MISSING_TOKEN', 'Missing token');
     try {
       req.user = jwt.verify(token, jwtSecret);
       next();
     } catch {
-      res.status(401).json({ error: 'Invalid token' });
+      res.status(401).json({ code: 'AUTH_INVALID_TOKEN', error: 'Invalid token' });
     }
   }
 
@@ -261,90 +392,218 @@ function createApp(options = {}) {
     return { allowed: count < 10, tier: 'free', remaining: Math.max(0, 10 - count) };
   }
 
+  const allergenSchema = z.union([
+    z.string().min(1),
+    z.object({
+      name: z.string().min(1),
+      severity: z.enum(['low', 'medium', 'high', 'unknown']).optional()
+    })
+  ]);
   const registerSchema = z.object({ email: z.string().email(), password: z.string().min(8), name: z.string().min(1), region: z.string().optional() });
   const loginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
+  const profileSchema = z.object({
+    name: z.string().min(1).optional(),
+    relationship: z.string().min(1).max(50).optional(),
+    allergies: z.array(allergenSchema).max(20).optional(),
+    goals: z.array(z.string().min(1)).max(20).optional(),
+    conditions: z.array(z.string().min(1)).max(20).optional(),
+    dietary_preferences: z.array(z.string().min(1)).max(20).optional(),
+    metrics: z.record(z.union([z.number().nonnegative(), z.string(), z.boolean()])).optional()
+  });
+  const onboardingSchema = z.object({
+    current_step: z.enum(ONBOARDING_STEPS).optional(),
+    completed_steps: z.array(z.enum(ONBOARDING_STEPS)).optional(),
+    preferences: z.record(z.any()).optional(),
+    skipped: z.boolean().optional()
+  });
 
   app.post('/api/auth/register', (req, res) => {
     const parsed = registerSchema.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-    const { email, password, name, region } = parsed.data;
+    if (!parsed.success) return sendError(res, 400, 'AUTH_INVALID_PAYLOAD', 'A valid email, password, and name are required');
+    const { password, name, region } = parsed.data;
+    const email = normalizeEmail(parsed.data.email);
+    if (!passwordMeetsPolicy(password)) {
+      return sendError(res, 400, 'AUTH_WEAK_PASSWORD', 'Password must be at least 8 characters and include an uppercase letter, number, and special character');
+    }
     const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-    if (existing) return res.status(409).json({ error: 'Email already exists' });
+    if (existing) return sendError(res, 409, 'AUTH_EMAIL_EXISTS', 'Email already exists');
     const hash = bcrypt.hashSync(password, 10);
     const result = db.prepare('INSERT INTO users (email, password_hash, name, region) VALUES (?, ?, ?, ?)').run(email, hash, name, region || null);
-    db.prepare('INSERT INTO profiles (user_id, name) VALUES (?, ?)').run(result.lastInsertRowid, `${name} (Primary)`);
+    db.prepare(`
+      INSERT INTO profiles (user_id, name, relationship, allergies, goals, conditions, dietary_preferences, metrics, last_updated_at, sync_retry_count)
+      VALUES (?, ?, ?, '[]', '[]', '[]', '[]', '{}', datetime('now'), 0)
+    `).run(result.lastInsertRowid, `${name} (Primary)`, 'self');
+    getOnboardingState(db, result.lastInsertRowid);
     const user = db.prepare('SELECT id, email, role FROM users WHERE id = ?').get(result.lastInsertRowid);
     const token = makeToken(user, jwtSecret);
-    res.status(201).json({ token, user: { id: user.id, email, name, region } });
+    const refresh_token = issueRefreshToken(db, user.id);
+    res.status(201).json({ token, refresh_token, user: { id: user.id, email, name, region } });
   });
 
   app.post('/api/auth/login', (req, res) => {
     const parsed = loginSchema.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(parsed.data.email);
-    if (!user || !bcrypt.compareSync(parsed.data.password, user.password_hash)) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!parsed.success) return sendError(res, 400, 'AUTH_INVALID_PAYLOAD', 'A valid email and password are required');
+    const email = normalizeEmail(parsed.data.email);
+    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+    if (!user || !bcrypt.compareSync(parsed.data.password, user.password_hash)) return sendError(res, 401, 'AUTH_INVALID_CREDENTIALS', 'Invalid credentials');
     const token = makeToken(user, jwtSecret);
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name, region: user.region, role: user.role } });
+    const refresh_token = issueRefreshToken(db, user.id);
+    res.json({ token, refresh_token, user: { id: user.id, email: user.email, name: user.name, region: user.region, role: user.role } });
+  });
+
+  app.post('/api/auth/refresh', (req, res) => {
+    const parsed = z.object({ refresh_token: z.string().min(20) }).safeParse(req.body);
+    if (!parsed.success) return sendError(res, 400, 'AUTH_INVALID_REFRESH', 'Valid refresh token required');
+    const rec = db.prepare('SELECT * FROM refresh_tokens WHERE token = ?').get(parsed.data.refresh_token);
+    if (!rec) return sendError(res, 401, 'AUTH_REFRESH_INVALID', 'Refresh token is invalid');
+    if (new Date(rec.expires_at).getTime() < Date.now()) {
+      db.prepare('DELETE FROM refresh_tokens WHERE token = ?').run(parsed.data.refresh_token);
+      return sendError(res, 401, 'AUTH_REFRESH_EXPIRED', 'Refresh token expired');
+    }
+    const user = db.prepare('SELECT id, email, role FROM users WHERE id = ?').get(rec.user_id);
+    if (!user) {
+      db.prepare('DELETE FROM refresh_tokens WHERE token = ?').run(parsed.data.refresh_token);
+      return sendError(res, 401, 'AUTH_REFRESH_INVALID', 'Refresh token is invalid');
+    }
+    db.prepare('DELETE FROM refresh_tokens WHERE token = ?').run(parsed.data.refresh_token);
+    const refresh_token = issueRefreshToken(db, user.id);
+    res.json({ token: makeToken(user, jwtSecret), refresh_token });
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    const parsed = z.object({ refresh_token: z.string().min(20) }).safeParse(req.body);
+    if (!parsed.success) return sendError(res, 400, 'AUTH_INVALID_REFRESH', 'Valid refresh token required');
+    db.prepare('DELETE FROM refresh_tokens WHERE token = ?').run(parsed.data.refresh_token);
+    res.json({ status: 'logged_out' });
   });
 
   app.post('/api/auth/password/forgot', (req, res) => {
     const email = z.string().email().safeParse(req.body.email);
-    if (!email.success) return res.status(400).json({ error: 'Valid email required' });
-    const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email.data);
+    if (!email.success) return sendError(res, 400, 'AUTH_INVALID_EMAIL', 'Valid email required');
+    const user = db.prepare('SELECT id FROM users WHERE email = ?').get(normalizeEmail(email.data));
     if (!user) return res.json({ status: 'ok' });
-    const token = `reset_${Math.random().toString(36).slice(2, 12)}`;
+    const token = `reset_${crypto.randomBytes(24).toString('hex')}`;
     db.prepare('INSERT OR REPLACE INTO password_resets (token, user_id, expires_at) VALUES (?, ?, datetime(\'now\', \'+30 minutes\'))').run(token, user.id);
     res.json({ status: 'ok', reset_token: token });
   });
 
   app.post('/api/auth/password/reset', (req, res) => {
     const parsed = z.object({ token: z.string().min(5), password: z.string().min(8) }).safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    if (!parsed.success) return sendError(res, 400, 'AUTH_INVALID_PAYLOAD', 'Valid reset token and password required');
+    if (!passwordMeetsPolicy(parsed.data.password)) {
+      return sendError(res, 400, 'AUTH_WEAK_PASSWORD', 'Password must be at least 8 characters and include an uppercase letter, number, and special character');
+    }
     const rec = db.prepare('SELECT * FROM password_resets WHERE token = ?').get(parsed.data.token);
-    if (!rec) return res.status(400).json({ error: 'Invalid token' });
-    if (new Date(rec.expires_at).getTime() < Date.now()) return res.status(400).json({ error: 'Token expired' });
+    if (!rec) return sendError(res, 400, 'AUTH_RESET_INVALID', 'Invalid token');
+    if (new Date(rec.expires_at).getTime() < Date.now()) return sendError(res, 400, 'AUTH_RESET_EXPIRED', 'Token expired');
     db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(parsed.data.password, 10), rec.user_id);
     db.prepare('DELETE FROM password_resets WHERE token = ?').run(parsed.data.token);
+    db.prepare('DELETE FROM refresh_tokens WHERE user_id = ?').run(rec.user_id);
     res.json({ status: 'password_updated' });
   });
 
   app.get('/api/auth/me', auth, (req, res) => {
     const user = db.prepare('SELECT id, email, name, region, role, created_at FROM users WHERE id = ?').get(req.user.sub);
-    const profiles = db.prepare('SELECT id, name, allergies, goals FROM profiles WHERE user_id = ? ORDER BY id').all(req.user.sub)
-      .map((p) => ({ ...p, allergies: JSON.parse(p.allergies || '[]'), goals: JSON.parse(p.goals || '[]') }));
-    res.json({ ...user, profiles });
+    const profiles = db.prepare(`
+      SELECT id, name, relationship, allergies, goals, conditions, dietary_preferences, metrics, created_at, last_updated_at, sync_retry_count
+      FROM profiles WHERE user_id = ? ORDER BY id
+    `).all(req.user.sub).map(formatProfile);
+    const onboarding = getOnboardingState(db, req.user.sub);
+    res.json({ ...user, profiles, onboarding });
   });
 
   app.put('/api/auth/me', auth, (req, res) => {
     const parsed = z.object({ name: z.string().min(1).optional(), region: z.string().optional() }).safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    if (!parsed.success) return sendError(res, 400, 'AUTH_INVALID_PAYLOAD', 'Valid account updates required');
     db.prepare('UPDATE users SET name = COALESCE(?, name), region = COALESCE(?, region) WHERE id = ?').run(parsed.data.name ?? null, parsed.data.region ?? null, req.user.sub);
     const user = db.prepare('SELECT id, email, name, region FROM users WHERE id = ?').get(req.user.sub);
     res.json(user);
   });
 
   app.get('/api/profiles', auth, (req, res) => {
-    const profiles = db.prepare('SELECT id, name, allergies, goals FROM profiles WHERE user_id = ? ORDER BY id').all(req.user.sub)
-      .map((p) => ({ ...p, allergies: JSON.parse(p.allergies || '[]'), goals: JSON.parse(p.goals || '[]') }));
+    const profiles = db.prepare(`
+      SELECT id, name, relationship, allergies, goals, conditions, dietary_preferences, metrics, created_at, last_updated_at, sync_retry_count
+      FROM profiles WHERE user_id = ? ORDER BY id
+    `).all(req.user.sub).map(formatProfile);
     res.json({ profiles });
   });
 
   app.post('/api/profiles', auth, (req, res) => {
-    const parsed = z.object({ name: z.string().min(1), allergies: z.array(z.string()).max(20).optional(), goals: z.array(z.string()).max(20).optional() }).safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    const parsed = profileSchema.extend({ name: z.string().min(1) }).safeParse(req.body);
+    if (!parsed.success) return sendError(res, 400, 'PROFILE_INVALID_PAYLOAD', 'Profile name and health preferences must be valid');
     const total = db.prepare('SELECT COUNT(*) AS c FROM profiles WHERE user_id = ?').get(req.user.sub).c;
-    if (total >= 5) return res.status(400).json({ error: 'Maximum 5 family profiles' });
-    const result = db.prepare('INSERT INTO profiles (user_id, name, allergies, goals) VALUES (?, ?, ?, ?)').run(req.user.sub, parsed.data.name, JSON.stringify(parsed.data.allergies || []), JSON.stringify(parsed.data.goals || []));
-    res.status(201).json({ id: result.lastInsertRowid, ...parsed.data });
+    if (total >= 5) return sendError(res, 400, 'PROFILE_LIMIT_REACHED', 'Maximum 5 family profiles');
+    const result = db.prepare(`
+      INSERT INTO profiles (user_id, name, relationship, allergies, goals, conditions, dietary_preferences, metrics, last_updated_at, sync_retry_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), 0)
+    `).run(
+      req.user.sub,
+      parsed.data.name,
+      parsed.data.relationship || null,
+      JSON.stringify(sanitizeAllergies(parsed.data.allergies || [])),
+      JSON.stringify(parsed.data.goals || []),
+      JSON.stringify(parsed.data.conditions || []),
+      JSON.stringify(parsed.data.dietary_preferences || []),
+      JSON.stringify(parsed.data.metrics || {})
+    );
+    const profile = db.prepare(`
+      SELECT id, name, relationship, allergies, goals, conditions, dietary_preferences, metrics, created_at, last_updated_at, sync_retry_count
+      FROM profiles WHERE id = ?
+    `).get(result.lastInsertRowid);
+    res.status(201).json(formatProfile(profile));
   });
 
   app.put('/api/profiles/:id', auth, (req, res) => {
-    const parsed = z.object({ name: z.string().min(1).optional(), allergies: z.array(z.string()).optional(), goals: z.array(z.string()).optional() }).safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    const parsed = profileSchema.safeParse(req.body);
+    if (!parsed.success) return sendError(res, 400, 'PROFILE_INVALID_PAYLOAD', 'Profile updates must be valid');
     const profile = db.prepare('SELECT * FROM profiles WHERE id = ? AND user_id = ?').get(req.params.id, req.user.sub);
-    if (!profile) return res.status(404).json({ error: 'Profile not found' });
-    db.prepare('UPDATE profiles SET name = ?, allergies = ?, goals = ? WHERE id = ?').run(parsed.data.name || profile.name, JSON.stringify(parsed.data.allergies || JSON.parse(profile.allergies || '[]')), JSON.stringify(parsed.data.goals || JSON.parse(profile.goals || '[]')), req.params.id);
-    res.json({ status: 'updated' });
+    if (!profile) return sendError(res, 404, 'PROFILE_NOT_FOUND', 'Profile not found');
+    db.prepare(`
+      UPDATE profiles
+      SET name = ?, relationship = ?, allergies = ?, goals = ?, conditions = ?, dietary_preferences = ?, metrics = ?, last_updated_at = datetime('now'), sync_retry_count = 0
+      WHERE id = ?
+    `).run(
+      parsed.data.name || profile.name,
+      parsed.data.relationship || profile.relationship || null,
+      JSON.stringify(parsed.data.allergies ? sanitizeAllergies(parsed.data.allergies) : parseJson(profile.allergies, [])),
+      JSON.stringify(parsed.data.goals || parseJson(profile.goals, [])),
+      JSON.stringify(parsed.data.conditions || parseJson(profile.conditions, [])),
+      JSON.stringify(parsed.data.dietary_preferences || parseJson(profile.dietary_preferences, [])),
+      JSON.stringify(parsed.data.metrics || parseJson(profile.metrics, {})),
+      req.params.id
+    );
+    const updated = db.prepare(`
+      SELECT id, name, relationship, allergies, goals, conditions, dietary_preferences, metrics, created_at, last_updated_at, sync_retry_count
+      FROM profiles WHERE id = ?
+    `).get(req.params.id);
+    res.json(formatProfile(updated));
+  });
+
+  app.get('/api/onboarding', auth, (req, res) => {
+    res.json(getOnboardingState(db, req.user.sub));
+  });
+
+  app.put('/api/onboarding', auth, (req, res) => {
+    const parsed = onboardingSchema.safeParse(req.body);
+    if (!parsed.success) return sendError(res, 400, 'ONBOARDING_INVALID_PAYLOAD', 'Onboarding updates must be valid');
+    const current = getOnboardingState(db, req.user.sub);
+    const completedSteps = parsed.data.completed_steps ? [...new Set(parsed.data.completed_steps)] : current.completed_steps;
+    const currentStep = parsed.data.current_step || current.current_step;
+    const preferences = parsed.data.preferences ? { ...current.preferences, ...parsed.data.preferences } : current.preferences;
+    const skipped = parsed.data.skipped ?? current.skipped;
+    const completed_at = completedSteps.length === ONBOARDING_STEPS.length || skipped ? new Date().toISOString() : null;
+    db.prepare(`
+      INSERT INTO onboarding_state (user_id, current_step, completed_steps, preferences, skipped, completed_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+      ON CONFLICT(user_id) DO UPDATE
+      SET current_step = excluded.current_step,
+          completed_steps = excluded.completed_steps,
+          preferences = excluded.preferences,
+          skipped = excluded.skipped,
+          completed_at = excluded.completed_at,
+          updated_at = datetime('now')
+    `).run(req.user.sub, currentStep, JSON.stringify(completedSteps), JSON.stringify(preferences), skipped ? 1 : 0, completed_at);
+    res.json(getOnboardingState(db, req.user.sub));
   });
 
   app.post('/api/subscriptions/start', auth, async (req, res, next) => {
@@ -547,9 +806,11 @@ function createApp(options = {}) {
 
   app.get('/api/docs', (_req, res) => {
     res.json({
-      auth: ['POST /api/auth/register', 'POST /api/auth/login', 'POST /api/auth/password/forgot', 'POST /api/auth/password/reset', 'GET/PUT /api/auth/me'],
+      auth: ['POST /api/auth/register', 'POST /api/auth/login', 'POST /api/auth/refresh', 'POST /api/auth/logout', 'POST /api/auth/password/forgot', 'POST /api/auth/password/reset', 'GET/PUT /api/auth/me'],
+      onboarding: ['GET /api/onboarding', 'PUT /api/onboarding'],
       payments: ['POST /api/subscriptions/start', 'POST /api/subscriptions/cancel', 'POST /api/subscriptions/upgrade', 'GET /api/subscriptions/status', 'GET /api/subscriptions/invoices', 'POST /api/payments/webhooks/stripe'],
       gamification: ['POST /api/gamification/events', 'GET /api/gamification/me', 'GET /api/gamification/leaderboard'],
+      profiles: ['GET /api/profiles', 'POST /api/profiles', 'PUT /api/profiles/:id'],
       core: ['GET /api/products/:barcode', 'POST /api/scans', 'GET /api/scans/history', 'GET /api/alternatives/:barcode', 'GET/POST/DELETE /api/saved-items'],
       corrections: ['POST /api/corrections', 'POST /api/corrections/:id/vote', 'POST /api/corrections/:id/verify', 'GET /api/corrections']
     });
